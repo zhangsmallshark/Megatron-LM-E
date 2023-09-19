@@ -41,6 +41,18 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
+import os
+import time
+from torch.profiler import profile, ProfilerActivity
+
+
+def is_rank_0():
+    # if torch.cuda.current_device() == 0:
+    if torch.distributed.get_rank() == 0:
+        return True
+    else:
+        return False
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -694,85 +706,108 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
-    while iteration < args.train_iters:
-        update_num_microbatches(args.consumed_train_samples)
-        args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler)
-        iteration += 1
-        args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
-                                       args.micro_batch_size * \
-                                       get_num_microbatches()
 
-        # Logging.
-        loss_scale = optimizer.get_loss_scale().item()
-        params_norm = None
-        if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
-        report_memory_flag = training_log(loss_dict, total_loss_dict,
-                                          optimizer.param_groups[0]['lr'],
-                                          iteration, loss_scale,
-                                          report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+    mp_size = os.environ.get('MPSIZE', 1)
+    seq_len = os.environ.get('NUM_K', 1)
+    micro_batch = os.environ.get('MICRO_BATCH', 1)
+    current_time = time.time()
+    local_time = time.localtime(current_time)
+    time_stamp = f'{local_time.tm_hour}-{local_time.tm_min}'
+    def trace_handler(prof):
+        # output = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
+        # print(output)
+        if is_rank_0():
+            prof.export_chrome_trace(f"./traces/{mp_size}MP-{seq_len}k-{micro_batch}MB-reduce-919-{time_stamp}.json")
 
-        # Autoresume
-        if args.adlr_autoresume and \
-           (iteration % args.adlr_autoresume_interval == 0):
-            check_adlr_autoresume_termination(iteration, model, optimizer,
-                                              opt_param_scheduler)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+        on_trace_ready=trace_handler
+    ) as prof:
+    # if True:
+        while iteration < args.train_iters:
+            update_num_microbatches(args.consumed_train_samples)
+            args.curr_iteration = iteration
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                        train_data_iterator,
+                        model,
+                        optimizer,
+                        opt_param_scheduler)
+            iteration += 1
+            timers.log(['forward-compute', 'forward-compute-no-batch', 'backward-compute'])
 
-        # Evaluation
-        if args.eval_interval and iteration % args.eval_interval == 0 and \
-           args.do_valid:
-            prefix = 'iteration {}'.format(iteration)
-            evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
-                                       False)
+            prof.step()
+            args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+                                        args.micro_batch_size * \
+                                        get_num_microbatches()
 
-        # Checkpointing
-        saved_checkpoint = False
-        if args.exit_signal_handler:
-            signal_handler = get_signal_handler()
-            if any(signal_handler.signals_received()):
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
-                print_datetime('exiting program after receiving SIGTERM.')
-                sys.exit()
+            # Logging.
+            loss_scale = optimizer.get_loss_scale().item()
+            params_norm = None
+            if args.log_params_norm:
+                params_norm = calc_params_l2_norm(model)
+            report_memory_flag = training_log(loss_dict, total_loss_dict,
+                                            optimizer.param_groups[0]['lr'],
+                                            iteration, loss_scale,
+                                            report_memory_flag, skipped_iter,
+                                            grad_norm, params_norm, num_zeros_in_grad)
 
-        if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
-            save_checkpoint_and_time(iteration, model, optimizer,
-                                     opt_param_scheduler)
-            saved_checkpoint = True
+            # Autoresume
+            if args.adlr_autoresume and \
+            (iteration % args.adlr_autoresume_interval == 0):
+                check_adlr_autoresume_termination(iteration, model, optimizer,
+                                                opt_param_scheduler)
 
-        # Exiting based on duration
-        if args.exit_duration_in_mins:
-            train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
-                [train_time > args.exit_duration_in_mins])
-            torch.distributed.all_reduce(
-                done_cuda, op=torch.distributed.ReduceOp.MAX)
-            done = done_cuda.item()
-            if done:
-                if not saved_checkpoint:
+            # Evaluation
+            if args.eval_interval and iteration % args.eval_interval == 0 and \
+            args.do_valid:
+                prefix = 'iteration {}'.format(iteration)
+                evaluate_and_print_results(prefix, forward_step_func,
+                                        valid_data_iterator, model,
+                                        iteration, process_non_loss_data_func,
+                                        False)
+
+            # Checkpointing
+            saved_checkpoint = False
+            if args.exit_signal_handler:
+                signal_handler = get_signal_handler()
+                if any(signal_handler.signals_received()):
                     save_checkpoint_and_time(iteration, model, optimizer,
-                                             opt_param_scheduler)
-                print_datetime('exiting program after {} minutes'.format(train_time))
-                sys.exit()
+                                            opt_param_scheduler)
+                    print_datetime('exiting program after receiving SIGTERM.')
+                    sys.exit()
 
-        # Exiting based on iterations
-        if args.exit_interval and iteration % args.exit_interval == 0:
-            if args.save and not saved_checkpoint:
+            if args.save and args.save_interval and \
+            iteration % args.save_interval == 0:
                 save_checkpoint_and_time(iteration, model, optimizer,
-                                         opt_param_scheduler)
-            torch.distributed.barrier()
-            print_datetime('exiting program at iteration {}'.format(iteration))
-            sys.exit()
+                                        opt_param_scheduler)
+                saved_checkpoint = True
+
+            # Exiting based on duration
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.cuda.IntTensor(
+                    [train_time > args.exit_duration_in_mins])
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    if not saved_checkpoint:
+                        save_checkpoint_and_time(iteration, model, optimizer,
+                                                opt_param_scheduler)
+                    print_datetime('exiting program after {} minutes'.format(train_time))
+                    sys.exit()
+
+            # Exiting based on iterations
+            if args.exit_interval and iteration % args.exit_interval == 0:
+                if args.save and not saved_checkpoint:
+                    save_checkpoint_and_time(iteration, model, optimizer,
+                                            opt_param_scheduler)
+                torch.distributed.barrier()
+                print_datetime('exiting program at iteration {}'.format(iteration))
+                sys.exit()
 
 
     return iteration

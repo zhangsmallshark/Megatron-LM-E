@@ -16,6 +16,21 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 
+from dist import setup_torch
+
+setup_torch(
+    backend='ddp',
+    port='5432',
+)
+
+
+def is_rank_0():
+    if torch.cuda.current_device() == 0:
+        return True
+    else:
+        return False
+
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
@@ -26,6 +41,7 @@ def model_provider(pre_process=True, post_process=True):
         pre_process=pre_process,
         post_process=post_process
     )
+    # print_rank_0(model)
     return model
 
 
@@ -82,8 +98,9 @@ def forward_step(data_iterator, model):
         data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    timers('forward-compute-no-batch', log_level=2).start()
+    output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+    timers('forward-compute-no-batch').stop()
 
     return output_tensor, partial(loss_func, loss_mask)
 

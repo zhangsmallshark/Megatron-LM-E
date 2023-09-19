@@ -714,3 +714,321 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
+
+
+class ColumnParallelLinear1(torch.nn.Module):
+    """Linear layer with column parallelism.
+
+    The linear layer is defined as Y = XA + b. A is parallelized along
+    its second dimension as A = [A_1, ..., A_p].
+
+    Arguments:
+        input_size: first dimension of matrix A.
+        output_size: second dimension of matrix A.
+
+    Keyword Arguments
+        bias: If true, add bias
+        gather_output: If true, call all-gather on output and make Y available
+                       to all GPUs, otherwise, every GPU will have its output
+                       which is Y_i = XA_i
+        init_method: method to initialize weights. Note that bias is always set
+                     to zero.
+        stride: For the strided linear layers.
+        keep_master_weight_for_test: This was added for testing and should be
+                                     set to False. It returns the master weights
+                                     used for initialization.
+        skip_bias_add: This was added to enable performance optimations where bias
+                       can be fused with other elementwise operations. we skip
+                       adding bias but instead return it.
+        async_tensor_model_parallel_allreduce:
+        params_dtype:
+        use_cpu_initialization:
+        gradient_accumulation_fusion:
+        sequence_parallel_enabled:
+    """
+
+    def __init__(self, input_size, output_size, intra_partitions, *,
+                 bias=True, gather_output=True,
+                 init_method=init.xavier_normal_, stride=1,
+                 keep_master_weight_for_test=False,
+                 skip_bias_add=False,
+                 async_tensor_model_parallel_allreduce=True,
+                 params_dtype=torch.float32,
+                 use_cpu_initialization=False,
+                 perform_initialization=True,
+                 gradient_accumulation_fusion=False,
+                 sequence_parallel_enabled: bool = False,
+                 ):
+        super(ColumnParallelLinear1, self).__init__()
+
+        # Keep input parameters
+        self.input_size = input_size
+        self.output_size = output_size
+        self.gather_output = gather_output
+        # Divide the weight matrix along the last dimension.
+        world_size = get_tensor_model_parallel_world_size()
+        self.output_size_per_partition = divide(output_size, world_size)
+        self.output_size_per_partition = divide(self.output_size_per_partition, intra_partitions)
+        self.skip_bias_add = skip_bias_add
+
+        # Parameters.
+        # Note: torch.nn.functional.linear performs XA^T + b and as a result
+        # we allocate the transpose.
+        # Initialize weight.
+        if use_cpu_initialization:
+            self.weight = Parameter(torch.empty(self.output_size_per_partition,
+                                                self.input_size,
+                                                dtype=params_dtype))
+            if perform_initialization:
+                self.master_weight = _initialize_affine_weight_cpu(
+                    self.weight, self.output_size, self.input_size,
+                    self.output_size_per_partition, 0, init_method,
+                    stride=stride, return_master_weight=keep_master_weight_for_test)
+        else:
+            self.weight = Parameter(torch.empty(
+                self.output_size_per_partition, self.input_size,
+                device=torch.cuda.current_device(), dtype=params_dtype))
+            if perform_initialization:
+                _initialize_affine_weight_gpu(self.weight, init_method,
+                                              partition_dim=0, stride=stride)
+
+        if bias:
+            if use_cpu_initialization:
+                self.bias = Parameter(torch.empty(
+                    self.output_size_per_partition, dtype=params_dtype))
+            else:
+                self.bias = Parameter(torch.empty(
+                    self.output_size_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=params_dtype))
+            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
+            # Always initialize bias to zero.
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            self.register_parameter('bias', None)
+
+        self.async_tensor_model_parallel_allreduce = (
+                async_tensor_model_parallel_allreduce and
+                world_size > 1)
+        if sequence_parallel_enabled:
+            if world_size <= 1:
+                warnings.warn(
+                    f"`sequence_parallel_enabled` is set to `True`, but tensor model parallel size is {world_size}. "
+                    f"Disabling sequence parallel."
+                )
+                sequence_parallel_enabled = False
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+
+        if gradient_accumulation_fusion:
+            if not _grad_accum_fusion_available:
+                raise RuntimeError(
+                    "ColumnParallelLinear was called with gradient_accumulation_fusion set "
+                    "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
+                    "module is not found. To use gradient_accumulation_fusion you must "
+                    "install APEX with --cpp_ext and --cuda_ext. For example: "
+                    "pip install --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\" "
+                    "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+                    "gradient accumulation fusion."
+                )
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
+
+        if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
+            raise RuntimeError(
+                "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` "
+                "cannot be enabled at the same time."
+            )
+
+
+    def forward(self, input_):
+        """Forward of ColumnParallelLinear
+
+        Args:
+            input_: 3D tensor whose order of dimension is [sequence, batch, hidden]
+
+        Returns:
+            - output
+            - bias
+        """
+        bias = self.bias if not self.skip_bias_add else None
+
+        # if self.async_tensor_model_parallel_allreduce or \
+        #         self.sequence_parallel_enabled:
+        #     input_parallel = input_
+        # else:
+        #     input_parallel = copy_to_tensor_model_parallel_region(input_)
+        input_parallel = input_
+
+        # Matrix multiply.
+        output_parallel = linear_with_grad_accumulation_and_async_allreduce(
+            input=input_parallel,
+            weight=self.weight,
+            bias=bias,
+            gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+        )
+        if self.gather_output:
+            # All-gather across the partitions.
+            assert not self.sequence_parallel_enabled
+            output = gather_from_tensor_model_parallel_region(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+from cut_attn.linear_cut1 import LinearCut1
+
+class RowParallelLinear1(torch.nn.Module):
+    """Linear layer with row parallelism.
+
+    The linear layer is defined as Y = XA + b. A is parallelized along
+    its first dimension and X along its second dimension as:
+               -   -
+              | A_1 |
+              | .   |
+          A = | .   |        X = [X_1, ..., X_p]
+              | .   |
+              | A_p |
+               -   -
+    Arguments:
+        input_size: first dimension of matrix A.
+        output_size: second dimension of matrix A.
+
+    Keyword Arguments:
+        bias: If true, add bias. Note that bias is not parallelized.
+        input_is_parallel: If true, we assume that the input is already
+                           split across the GPUs and we do not split
+                           again.
+        init_method: method to initialize weights. Note that bias is always set
+                     to zero.
+        stride: For the strided linear layers.
+        keep_master_weight_for_test: This was added for testing and should be
+                                     set to False. It returns the master weights
+                                     used for initialization.
+        skip_bias_add: This was added to enable performance optimization where bias
+                       can be fused with other elementwise operations. We skip
+                       adding bias but instead return it.
+        params_dtype:
+        use_cpu_initialization:
+        perform_initialization:
+        gradient_accumulation_fusion:
+        sequence_parallel_enabled:
+    """
+
+    def __init__(self, input_size, output_size, intra_partitions, *,
+                 bias=True, input_is_parallel=False,
+                 init_method=init.xavier_normal_, stride=1,
+                 keep_master_weight_for_test=False,
+                 skip_bias_add=False,
+                 params_dtype=torch.float32,
+                 use_cpu_initialization=False,
+                 perform_initialization=True,
+                 gradient_accumulation_fusion=False,
+                 sequence_parallel_enabled: bool = False,
+                 ):
+        super(RowParallelLinear1, self).__init__()
+
+        # Keep input parameters
+        self.input_size = input_size
+        self.output_size = divide(output_size, intra_partitions)
+        self.input_is_parallel = input_is_parallel
+        # Divide the weight matrix along the last dimension.
+        world_size = get_tensor_model_parallel_world_size()
+        self.input_size_per_partition = divide(input_size, world_size)
+        # self.input_size_per_partition = divide(self.input_size_per_partition, intra_partitions)
+        self.skip_bias_add = skip_bias_add
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
+        self.sequence_parallel_enabled = sequence_parallel_enabled
+        if self.sequence_parallel_enabled and not self.input_is_parallel:
+            raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
+
+        self.comm_start = torch.cuda.Event(blocking=True)
+
+        # Parameters.
+        # Note: torch.nn.functional.linear performs XA^T + b and as a result
+        # we allocate the transpose.
+        # Initialize weight.
+        if use_cpu_initialization:
+            self.weight = Parameter(torch.empty(self.output_size,
+                                                self.input_size_per_partition,
+                                                dtype=params_dtype))
+            if perform_initialization:
+                self.master_weight = _initialize_affine_weight_cpu(
+                    self.weight, self.output_size, self.input_size,
+                    self.input_size_per_partition, 1, init_method,
+                    stride=stride, return_master_weight=keep_master_weight_for_test,
+                    params_dtype=params_dtype)
+        else:
+            self.weight = Parameter(torch.empty(
+                self.output_size, self.input_size_per_partition,
+                device=torch.cuda.current_device(), dtype=params_dtype))
+            if perform_initialization:
+                _initialize_affine_weight_gpu(self.weight, init_method,
+                                              partition_dim=1, stride=stride)
+        # if bias:
+        if True:
+            if use_cpu_initialization:
+                self.bias = Parameter(torch.empty(self.output_size,
+                                                  dtype=params_dtype))
+            else:
+                self.bias = Parameter(torch.empty(
+                    self.output_size, device=torch.cuda.current_device(),
+                    dtype=params_dtype))
+            setattr(self.bias, 'sequence_parallel', sequence_parallel_enabled)
+
+            # Always initialize bias to zero.
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            self.register_parameter('bias', None)
+
+        self.linear1 = LinearCut1()
+
+
+    def forward(self, input_):
+        """Forward of RowParallelLinear
+
+        Args:
+            input_: 3D tensor whose order of dimension is [sequence, batch, hidden]
+
+        Returns:
+            - output
+            - bias
+        """
+        self.comm_start.record()
+        # Set up backprop all-reduce.
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            assert not self.sequence_parallel_enabled
+            input_parallel = scatter_to_tensor_model_parallel_region(input_)
+    
+        # Matrix multiply.
+        # output_parallel = linear_with_grad_accumulation_and_async_allreduce(
+        #     input=input_parallel,
+        #     weight=self.weight,
+        #     bias=None,
+        #     gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+        #     async_grad_allreduce=False,
+        #     sequence_parallel_enabled=False,
+        # )
+        output_parallel = self.linear1(torch.squeeze(input_parallel), self.weight, self.bias)
+        output_parallel = torch.unsqueeze(output_parallel, dim=1)
+
+        # print(f'input_ {input_.shape}')
+        # print(f'self.weight {self.weight.shape}')
+        # print(f'output_parallel {output_parallel.shape}')
+
+        # All-reduce across all the partitions.
+        if self.sequence_parallel_enabled:
+            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+        else:
+            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+        if not self.skip_bias_add:
+            output = output_ + self.bias if self.bias is not None else output_
+            output_bias = None
+        else:
+            output = output_
+            output_bias = self.bias
+        return output, output_bias

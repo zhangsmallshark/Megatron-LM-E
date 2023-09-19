@@ -4,6 +4,8 @@ from .data import broadcast_data
 from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
+    ColumnParallelLinear1,
+    RowParallelLinear1,
     VocabParallelEmbedding,
     set_tensor_model_parallel_attributes,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
@@ -41,6 +43,8 @@ __all__ = [
     #layers.py
     "ColumnParallelLinear",
     "RowParallelLinear",
+    "ColumnParallelLinear1",
+    "RowParallelLinear1",
     "VocabParallelEmbedding",
     "set_tensor_model_parallel_attributes",
     "set_defaults_if_not_set_tensor_model_parallel_attributes",

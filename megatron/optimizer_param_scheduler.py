@@ -113,7 +113,8 @@ class OptimizerParamScheduler(object):
             raise Exception('{} decay style is not supported.'.format(
                 self.lr_decay_style))
 
-        return self.min_lr + coeff * delta_lr
+        return 0.00015
+        # return self.min_lr + coeff * delta_lr
 
 
     def step(self, increment):
@@ -122,8 +123,10 @@ class OptimizerParamScheduler(object):
         new_lr = self.get_lr()
         new_wd = self.get_wd()
         for group in self.optimizer.param_groups:
-            group['lr'] = new_lr * group.get('lr_mult', 1.0)
-            group['weight_decay'] = new_wd * group.get('wd_mult', 1.0)
+            # group['lr'] = new_lr * group.get('lr_mult', 1.0)
+            # group['weight_decay'] = new_wd * group.get('wd_mult', 1.0)
+            group['lr'] = 0.00015
+            group['weight_decay'] = 1.0
 
 
     def state_dict(self):
